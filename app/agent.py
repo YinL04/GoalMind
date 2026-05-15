@@ -7,14 +7,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from dotenv import load_dotenv
+from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI
 
-from app.prompts import ANSWER_PROMPT, SYSTEM_PROMPT
-from app.schemas import FootballFanAnswer, QuestionExtraction
+from app.prompts import ANSWER_PROMPT, PLANNER_PROMPT, SYSTEM_PROMPT
+from app.schemas import AgentPlan, ExecutedStep, FootballFanAnswer, PlanStep, QuestionExtraction
 from app.services.extractor import extract_question_info
 from app.services.query_builder import build_football_queries
-from app.tools.duckduckgo import duckduckgo_search
-from app.tools.webpage import fetch_url_text
+from app.tools.duckduckgo import duckduckgo_search_tool
+from app.tools.webpage import fetch_url_text_tool
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 WORKSPACE_DIR = PROJECT_DIR.parent
@@ -56,37 +57,30 @@ def answer_football_question(question: str, progress: ProgressCallback | None = 
     teams = [team for team in [extraction.team_a, extraction.team_b] if team]
     _progress(progress, f"识别结果：teams={teams}, competition={extraction.competition or '未识别'}")
 
-    queries = build_football_queries(question, extraction.team_a, extraction.team_b, extraction.competition)
-    _progress(progress, f"生成 {len(queries)} 条搜索 query")
+    fallback_queries = build_football_queries(question, extraction.team_a, extraction.team_b, extraction.competition)
 
-    max_results = int(os.getenv("FOOTBALL_AGENT_MAX_SEARCH_RESULTS", "5"))
-    fetch_top_n = int(os.getenv("FOOTBALL_AGENT_FETCH_TOP_N", "5"))
+    _progress(progress, "Planner：生成可执行检索计划")
+    plan = _create_plan(llm, question, extraction, fallback_queries, progress=progress)
+    _progress(progress, f"Planner：生成 {len(plan.steps)} 个执行步骤")
+    for step in plan.steps:
+        _progress(progress, f"Plan step：{step.id} | {step.query}")
 
-    search_results = _search_many(queries, max_results=max_results, progress=progress)
-    urls = _select_urls(search_results, limit=fetch_top_n)
+    _progress(progress, "Executor：开始执行计划")
+    executed_steps = _execute_plan(plan, progress=progress)
 
-    _progress(progress, f"选择 {len(urls)} 个网页抓取正文")
-    pages: list[dict[str, Any]] = []
-    for index, url in enumerate(urls, start=1):
-        _progress(progress, f"抓取网页 {index}/{len(urls)}：{url}")
-        page = fetch_url_text(url)
-        if page.get("error"):
-            _progress(progress, f"网页抓取失败，继续使用搜索摘要：{page.get('error')}")
-        pages.append(page)
-
-    _progress(progress, "合并搜索摘要和网页正文")
-    context = _build_context(queries, search_results, pages)
-    sources = _collect_sources(search_results, pages)
+    _progress(progress, "Executor：整理执行材料")
+    context = _build_execution_context(plan, executed_steps)
+    sources = _collect_sources_from_steps(executed_steps)
 
     if llm is None:
         _progress(progress, "未检测到 LLM API key，返回降级结果")
         return _fallback_answer(question, extraction, sources, "未配置可用 LLM，仅返回保守降级结果。")
 
     try:
-        _progress(progress, "调用 LLM 生成 JSON 回答")
-        answer = _generate_answer_with_json(llm, question, extraction, context, sources)
+        _progress(progress, "Synthesizer：调用 LLM 生成 JSON 回答")
+        answer = _synthesize_answer(llm, question, extraction, plan, context, sources)
     except Exception as exc:
-        _progress(progress, f"LLM 生成失败：{exc}")
+        _progress(progress, f"Synthesizer：LLM 生成失败：{exc}")
         return _fallback_answer(question, extraction, sources, f"LLM 生成失败：{exc}")
 
     _progress(progress, "回答生成完成")
@@ -139,10 +133,137 @@ def _build_llm(timeout: int = 45) -> ChatOpenAI | None:
     )
 
 
-def _generate_answer_with_json(
+def _create_plan(
+    llm: ChatOpenAI | None,
+    question: str,
+    extraction: QuestionExtraction,
+    fallback_queries: list[str],
+    progress: ProgressCallback | None = None,
+) -> AgentPlan:
+    if llm is None:
+        _progress(progress, "Planner：无 LLM，使用规则计划")
+        return _fallback_plan(question, extraction, fallback_queries)
+
+    planner_chain = RunnableLambda(
+        lambda payload: llm.invoke(
+            [
+                ("system", SYSTEM_PROMPT),
+                (
+                    "human",
+                    PLANNER_PROMPT.format(
+                        question=payload["question"],
+                        extraction=payload["extraction"],
+                        fallback_queries=payload["fallback_queries"],
+                    ),
+                ),
+            ]
+        )
+    ) | RunnableLambda(lambda message: _loads_json_object(str(getattr(message, "content", "")))) | RunnableLambda(
+        AgentPlan.model_validate
+    )
+
+    try:
+        return planner_chain.invoke(
+            {
+                "question": question,
+                "extraction": extraction.model_dump_json(ensure_ascii=False),
+                "fallback_queries": "\n".join(f"- {query}" for query in fallback_queries),
+            }
+        )
+    except Exception as exc:
+        _progress(progress, f"Planner：LLM 计划失败，使用规则计划：{exc}")
+        return _fallback_plan(question, extraction, fallback_queries)
+
+
+def _fallback_plan(
+    question: str,
+    extraction: QuestionExtraction,
+    queries: list[str],
+) -> AgentPlan:
+    teams = [team for team in [extraction.team_a, extraction.team_b] if team]
+    steps = [
+        PlanStep(
+            id=f"search_{index}",
+            tool="football_search",
+            purpose=_infer_query_purpose(query),
+            query=query,
+            max_results=int(os.getenv("FOOTBALL_AGENT_MAX_SEARCH_RESULTS", "5")),
+            fetch_top_n=1,
+        )
+        for index, query in enumerate(queries, start=1)
+    ]
+    return AgentPlan(
+        objective=f"回答用户问题：{question}",
+        teams=teams,
+        competition=extraction.competition,
+        assumptions=["LLM planner 不可用或返回格式不合法，使用规则 query 生成器作为计划。"],
+        steps=steps,
+        answer_strategy="按伤停、阵容、状态、战术和比赛走势组织回答，并明确不确定性。",
+    )
+
+
+def _execute_plan(plan: AgentPlan, progress: ProgressCallback | None = None) -> list[ExecutedStep]:
+    executed: list[ExecutedStep] = []
+    seen_urls: set[str] = set()
+
+    for index, step in enumerate(plan.steps, start=1):
+        _progress(progress, f"Executor：执行 {index}/{len(plan.steps)} | {step.purpose}")
+        if step.tool != "football_search":
+            executed.append(
+                ExecutedStep(
+                    id=step.id,
+                    purpose=step.purpose,
+                    query=step.query,
+                    errors=[f"Unsupported tool: {step.tool}"],
+                )
+            )
+            continue
+
+        search_results = duckduckgo_search_tool.invoke(
+            {"query": step.query, "max_results": step.max_results}
+        )
+        if not isinstance(search_results, list):
+            search_results = []
+
+        errors = [str(item.get("error")) for item in search_results if isinstance(item, dict) and item.get("error")]
+        if errors:
+            _progress(progress, f"Executor：搜索错误：{errors[0]}")
+        else:
+            _progress(progress, f"Executor：搜索得到 {len(search_results)} 条结果")
+
+        urls = _select_urls(search_results, limit=step.fetch_top_n)
+        fetched_pages: list[dict[str, Any]] = []
+        for url in urls:
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            _progress(progress, f"Executor：抓取网页：{url}")
+            page = fetch_url_text_tool.invoke({"url": url, "max_chars": 8000})
+            if isinstance(page, dict):
+                if page.get("error"):
+                    errors.append(str(page.get("error")))
+                    _progress(progress, f"Executor：网页抓取失败：{page.get('error')}")
+                fetched_pages.append(page)
+
+        executed.append(
+            ExecutedStep(
+                id=step.id,
+                purpose=step.purpose,
+                query=step.query,
+                search_results=search_results,
+                fetched_pages=fetched_pages,
+                errors=errors,
+            )
+        )
+
+    return executed
+
+
+def _synthesize_answer(
     llm: ChatOpenAI,
     question: str,
     extraction: QuestionExtraction,
+    plan: AgentPlan,
     context: str,
     sources: list[str],
 ) -> FootballFanAnswer:
@@ -154,6 +275,7 @@ def _generate_answer_with_json(
                 ANSWER_PROMPT.format(
                     question=question,
                     extraction=extraction.model_dump_json(ensure_ascii=False),
+                    plan=plan.model_dump_json(ensure_ascii=False),
                     context=context,
                     sources="\n".join(sources) if sources else "无可用 URL",
                 ),
@@ -184,35 +306,6 @@ def _loads_json_object(content: str) -> dict[str, Any]:
     return parsed
 
 
-def _search_many(
-    queries: list[str],
-    max_results: int,
-    progress: ProgressCallback | None = None,
-) -> list[dict[str, Any]]:
-    combined: list[dict[str, Any]] = []
-    seen_urls: set[str] = set()
-    for index, query in enumerate(queries, start=1):
-        _progress(progress, f"搜索 {index}/{len(queries)}：{query}")
-        results = duckduckgo_search(query, max_results=max_results)
-        error_count = sum(1 for result in results if result.get("error"))
-        if error_count:
-            _progress(progress, f"搜索返回错误：{results[0].get('error')}")
-        else:
-            _progress(progress, f"搜索得到 {len(results)} 条结果")
-            if not results:
-                _progress(progress, "该 query 没有返回结果，将继续尝试下一条 query")
-
-        for result in results:
-            item = dict(result)
-            item["query"] = query
-            href = item.get("href", "")
-            key = href or f"{query}:{item.get('title', '')}"
-            if key not in seen_urls:
-                seen_urls.add(key)
-                combined.append(item)
-    return combined
-
-
 def _select_urls(search_results: list[dict[str, Any]], limit: int) -> list[str]:
     urls: list[str] = []
     for result in search_results:
@@ -233,36 +326,58 @@ def _is_low_value_url(url: str) -> bool:
     return any(domain in lowered for domain in LOW_VALUE_DOMAINS)
 
 
-def _build_context(
-    queries: list[str],
-    search_results: list[dict[str, Any]],
-    pages: list[dict[str, Any]],
-) -> str:
-    parts = ["## Search Queries", *[f"- {query}" for query in queries], "\n## DuckDuckGo Results"]
+def _build_execution_context(plan: AgentPlan, executed_steps: list[ExecutedStep]) -> str:
+    parts = [
+        "## Agent Plan",
+        plan.model_dump_json(ensure_ascii=False, indent=2),
+        "\n## Executed Steps",
+    ]
 
-    for index, result in enumerate(search_results[:30], start=1):
-        error = result.get("error")
-        if error:
-            parts.append(f"{index}. ERROR: {error}")
-            continue
+    for index, step in enumerate(executed_steps, start=1):
         parts.append(
+            "\n".join(
+                [
+                    f"### Step {index}: {step.id}",
+                    f"Purpose: {step.purpose}",
+                    f"Query: {step.query}",
+                    f"Errors: {step.errors or []}",
+                    "Search Results:",
+                    _format_search_results(step.search_results),
+                    "Fetched Pages:",
+                    _format_pages(step.fetched_pages),
+                ]
+            )
+        )
+
+    return "\n\n".join(parts)
+
+
+def _format_search_results(results: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for index, result in enumerate(results[:8], start=1):
+        if result.get("error"):
+            lines.append(f"{index}. ERROR: {result.get('error')}")
+            continue
+        lines.append(
             "\n".join(
                 [
                     f"{index}. {result.get('title', '')}",
                     f"URL: {result.get('href', '')}",
                     f"Snippet: {result.get('snippet', '')}",
-                    f"Query: {result.get('query', '')}",
                 ]
             )
         )
+    return "\n".join(lines) if lines else "No search results."
 
-    parts.append("\n## Webpage Text")
-    for index, page in enumerate(pages, start=1):
+
+def _format_pages(pages: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for index, page in enumerate(pages[:5], start=1):
         if page.get("error"):
-            parts.append(f"{index}. URL: {page.get('url', '')}\nFetch error: {page.get('error')}")
+            lines.append(f"{index}. URL: {page.get('url', '')}\nFetch error: {page.get('error')}")
             continue
-        text = (page.get("text") or "")[:5000]
-        parts.append(
+        text = (page.get("text") or "")[:4000]
+        lines.append(
             "\n".join(
                 [
                     f"{index}. {page.get('title', '')}",
@@ -272,20 +387,20 @@ def _build_context(
                 ]
             )
         )
+    return "\n".join(lines) if lines else "No fetched pages."
 
-    return "\n\n".join(parts)
 
-
-def _collect_sources(search_results: list[dict[str, Any]], pages: list[dict[str, Any]]) -> list[str]:
+def _collect_sources_from_steps(executed_steps: list[ExecutedStep]) -> list[str]:
     sources: list[str] = []
-    for page in pages:
-        url = page.get("url")
-        if url and url not in sources:
-            sources.append(url)
-    for result in search_results:
-        url = result.get("href") or result.get("url")
-        if url and not result.get("error") and url not in sources:
-            sources.append(url)
+    for step in executed_steps:
+        for page in step.fetched_pages:
+            url = page.get("url")
+            if url and url not in sources:
+                sources.append(url)
+        for result in step.search_results:
+            url = result.get("href") or result.get("url")
+            if url and not result.get("error") and url not in sources:
+                sources.append(url)
     return sources[:12]
 
 
@@ -315,6 +430,21 @@ def _fallback_answer(
         sources=sources,
         uncertainty_note=note,
     )
+
+
+def _infer_query_purpose(query: str) -> str:
+    lowered = query.lower()
+    if "injur" in lowered or "suspension" in lowered:
+        return "查找伤病和停赛信息"
+    if "lineup" in lowered:
+        return "查找预计首发和阵容信息"
+    if "tactical" in lowered:
+        return "查找战术分析"
+    if "head to head" in lowered:
+        return "查找历史交锋"
+    if "recent form" in lowered:
+        return "查找近期状态"
+    return "查找赛前/赛后分析材料"
 
 
 def _sanitize_answer(answer: FootballFanAnswer) -> FootballFanAnswer:

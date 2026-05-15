@@ -49,3 +49,30 @@ class QuestionExtraction(BaseModel):
     competition: Optional[str] = None
     date: Optional[str] = None
     focus: list[str] = Field(default_factory=list)
+
+
+class PlanStep(BaseModel):
+    id: str = Field(..., description="计划步骤 ID，例如 search_injuries_a")
+    tool: str = Field("football_search", description="要调用的工具名称")
+    purpose: str = Field(..., description="这一步要回答的信息需求")
+    query: str = Field(..., description="搜索 query")
+    max_results: int = Field(5, ge=1, le=10)
+    fetch_top_n: int = Field(1, ge=0, le=3)
+
+
+class AgentPlan(BaseModel):
+    objective: str
+    teams: list[str] = Field(default_factory=list)
+    competition: Optional[str] = None
+    assumptions: list[str] = Field(default_factory=list)
+    steps: list[PlanStep] = Field(default_factory=list)
+    answer_strategy: str
+
+
+class ExecutedStep(BaseModel):
+    id: str
+    purpose: str
+    query: str
+    search_results: list[dict] = Field(default_factory=list)
+    fetched_pages: list[dict] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
