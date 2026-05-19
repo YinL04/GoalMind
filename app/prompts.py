@@ -40,6 +40,9 @@ PLANNER_PROMPT = """你是一个足球问答 Agent 的 Planner。
 
 请根据用户问题和已识别信息，制定一个可执行的信息检索计划。
 
+当前日期/时间语境：
+{date_context}
+
 用户问题：
 {question}
 
@@ -53,34 +56,98 @@ PLANNER_PROMPT = """你是一个足球问答 Agent 的 Planner。
 1. 返回纯 JSON，不要 Markdown，不要解释。
 2. 计划必须覆盖：球队新闻、伤病停赛、预计首发、赛前分析、战术看点、近期状态、历史交锋。
 3. 如果只有一支球队，也要围绕这支球队生成状态、伤停、战术、近期比赛等步骤。
-4. 每个 step 代表一次可执行工具调用，tool 固定为 "football_search"。
-5. query 尽量使用英文，以提升搜索命中率。
+4. 每个 step 代表一次可执行工具调用。可用 tool：
+   - "football_search": 用 query 搜索资讯。
+   - "fetch_webpage_text": 只在用户问题或前文明确给出 URL 时使用，必须提供 url。
+5. 搜索 query 尽量使用英文，并带上日期/赛季/赛事信息，以提升命中率和时效性。
 6. steps 数量控制在 5 到 8 个。
 
 JSON 结构：
-{
+{{
   "objective": "本次计划目标",
   "teams": ["team names"],
   "competition": "competition or null",
   "assumptions": ["不确定但需要说明的假设"],
   "steps": [
-    {
+    {{
       "id": "search_match_preview",
       "tool": "football_search",
       "purpose": "为什么要搜索这条信息",
       "query": "search query",
+      "url": null,
       "max_results": 5,
       "fetch_top_n": 1
-    }
+    }}
   ],
   "answer_strategy": "最后回答时如何组织信息"
-}
+}}
+"""
+
+REPLAN_PROMPT = """你是一个足球问答 Agent 的 Replanner。
+
+第一轮执行材料不足，请只针对缺口补充一个小型检索计划，不要重复已经执行过的 query。
+
+当前日期/时间语境：
+{date_context}
+
+用户问题：
+{question}
+
+已识别信息：
+{extraction}
+
+已有计划和执行摘要：
+{execution_summary}
+
+基础 query 候选：
+{fallback_queries}
+
+要求：
+1. 返回纯 JSON，不要 Markdown，不要解释。
+2. 只补充 1 到 3 个 steps。
+3. 优先补足伤停、预计首发、可靠赛前报道、近期状态中缺失的信息。
+4. tool 使用 "football_search"，除非明确有 URL 才使用 "fetch_webpage_text"。
+5. query 使用英文，并带上日期、赛季或赛事信息。
+
+JSON 结构：
+{{
+  "objective": "补充检索目标",
+  "teams": ["team names"],
+  "competition": "competition or null",
+  "assumptions": ["为什么需要补检索"],
+  "steps": [
+    {{
+      "id": "supplemental_search_1",
+      "tool": "football_search",
+      "purpose": "要补足的信息缺口",
+      "query": "search query",
+      "url": null,
+      "max_results": 5,
+      "fetch_top_n": 1
+    }}
+  ],
+  "answer_strategy": "如何把补充材料用于回答"
+}}
+"""
+
+JSON_REPAIR_PROMPT = """上一次输出不能被解析或不符合目标 JSON schema。
+
+请根据原始内容修复为纯 JSON 对象，不要添加 Markdown 或解释。
+
+目标 schema 名称：
+{schema_name}
+
+原始内容：
+{bad_content}
 """
 
 ANSWER_PROMPT = """请基于 Plan-and-Execute 过程中的执行材料回答用户问题。
 
 用户问题：
 {question}
+
+当前日期/时间语境：
+{date_context}
 
 识别信息：
 {extraction}

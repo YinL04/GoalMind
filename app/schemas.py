@@ -53,9 +53,10 @@ class QuestionExtraction(BaseModel):
 
 class PlanStep(BaseModel):
     id: str = Field(..., description="计划步骤 ID，例如 search_injuries_a")
-    tool: str = Field("football_search", description="要调用的工具名称")
+    tool: str = Field("football_search", description="要调用的工具名称：football_search 或 fetch_webpage_text")
     purpose: str = Field(..., description="这一步要回答的信息需求")
-    query: str = Field(..., description="搜索 query")
+    query: str = Field("", description="搜索 query；抓取网页工具可留空")
+    url: Optional[str] = Field(None, description="fetch_webpage_text 工具要抓取的 URL")
     max_results: int = Field(5, ge=1, le=10)
     fetch_top_n: int = Field(1, ge=0, le=3)
 

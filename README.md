@@ -10,9 +10,13 @@
 - LangChain + `langchain-openai` 调用 LLM
 - DuckDuckGo 免费搜索层
 - `requests` + `BeautifulSoup` 网页正文抓取和清洗
+- Plan-and-Execute 流程：先规划检索步骤，再执行搜索/网页抓取，材料不足时自动补充检索
+- 日期感知 query：会把“今天、今晚、明天、5月21日”等相对/绝对日期注入检索语境
+- 来源排序与低价值来源过滤，优先使用更可靠的官方、媒体和数据源
 - JSON 本地 TTL 缓存，默认 6 小时
-- Pydantic 结构化输出
+- Pydantic 结构化输出，LLM JSON 不稳定时会尝试修复后再校验
 - 搜索失败、网页抓取失败或 LLM 不可用时尽量降级返回清晰说明
+- 扩展了博彩、盘口、赔率等中英文风险表达过滤
 
 ## 项目结构
 
@@ -30,10 +34,25 @@ football_fan_agent/
       query_builder.py
       cache.py
       extractor.py
+  tests/
+    test_agent_core.py
   .env.example
   requirements.txt
   README.md
 ```
+
+## 本次更新简述
+
+本次更新重点补强了 Agent 的计划执行能力和稳定性：
+
+- Planner 不再只生成单一搜索步骤，现在支持 `football_search` 和 `fetch_webpage_text` 两类工具。
+- Executor 改为按计划步骤的 `tool` 字段调度工具，并记录每步搜索、抓取和错误信息。
+- 新增 Replanner：当第一轮搜索材料太少或网页正文不足时，会自动生成并执行补充检索计划。
+- 搜索 query 会结合当前日期和问题中的日期表达，减少赛前信息过期或语境漂移。
+- 搜索结果会按来源可信度、足球相关性和低价值域名进行排序/过滤。
+- LLM 输出优先使用结构化输出；失败时回退到纯 JSON 解析，再失败会请求模型修复 JSON。
+- `FOOTBALL_AGENT_FETCH_TOP_N` 现在真正影响每个搜索步骤抓取多少个网页，并增加重规划阈值配置。
+- 新增单元测试，覆盖 prompt 格式化、日期处理、来源排序、补检索判断和安全过滤。
 
 ## 安装
 
@@ -61,7 +80,9 @@ OPENAI_BASE_URL=
 FOOTBALL_AGENT_CACHE_PATH=.cache/football_agent_cache.json
 FOOTBALL_AGENT_CACHE_TTL_SECONDS=21600
 FOOTBALL_AGENT_MAX_SEARCH_RESULTS=5
-FOOTBALL_AGENT_FETCH_TOP_N=5
+FOOTBALL_AGENT_FETCH_TOP_N=1
+FOOTBALL_AGENT_REPLAN_MIN_SOURCES=2
+FOOTBALL_AGENT_REPLAN_MIN_TEXT_CHARS=1200
 LLM_CONNECT_TIMEOUT_SECONDS=15
 SEARXNG_BASE_URL=
 ```
@@ -169,5 +190,6 @@ curl -X POST "http://127.0.0.1:8000/ask" ^
 
 - 这是球迷信息问答助手，不提供投注建议。
 - DuckDuckGo 结果质量和网页可抓取性会影响回答质量。
+- 如果第一轮材料不足，系统会自动补充检索，但外部搜索结果仍可能存在时效性和可抓取性限制。
 - 预计首发、伤病恢复、赛前训练消息通常有不确定性，回答会尽量区分已确认信息和媒体推测。
 - 如果外部搜索或网页抓取失败，服务不会直接崩溃，会在 `uncertainty_note` 或来源信息中说明。

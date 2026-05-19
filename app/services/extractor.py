@@ -66,7 +66,7 @@ def extract_question_info(question: str, llm: ChatOpenAI | None = None) -> Quest
 
 def _rule_based_extract(question: str) -> QuestionExtraction:
     found_teams: list[str] = []
-    for cn_name, en_name in COMMON_TEAMS.items():
+    for cn_name, en_name in sorted(COMMON_TEAMS.items(), key=lambda item: len(item[0]), reverse=True):
         if cn_name in question and en_name not in found_teams:
             found_teams.append(en_name)
 
